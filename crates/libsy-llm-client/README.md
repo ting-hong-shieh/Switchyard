@@ -61,6 +61,7 @@ fn build_client() -> switchyard_llm_client::Result<TranslatingLlmClient> {
     let openai = HttpBackendConfig {
         base_url: "https://api.openai.com/v1".to_string(),
         api_key: std::env::var("OPENAI_API_KEY").ok(),
+        forward_auth: false,
         extra_headers: BTreeMap::new(),
         extra_body: BTreeMap::new(),
         max_retries: 2,
@@ -212,6 +213,11 @@ fn build_multi_format_client(
   `host`, `content-length`, `connection`, and the backend-owned
   `authorization` / `x-api-key` / `anthropic-version` / `content-type`. So a
   caller's placeholder credential never overrides the backend's real key.
+- `HttpBackendConfig::forward_auth` forwards the caller's `authorization` or
+  `x-api-key` header instead of using the backend's configured key. Leave it
+  disabled unless the configured upstream should receive each caller's credential.
+  It also forwards `oauth-*` markers from `anthropic-beta` while removing other
+  caller-supplied beta values.
 - Per-backend static headers go in `HttpBackendConfig::extra_headers`.
 - Per-target top-level request defaults go in `HttpBackendConfig::extra_body`.
   The merge is shallow and fields already present in the request take precedence.
