@@ -45,7 +45,7 @@ route reaches no upstream. A file without a `[targets]` table is rejected with
 | `format` | Yes | — | `openai_chat`, `openai_responses`, or `anthropic_messages`. |
 | `base_url` | Yes | — | Upstream base URL. |
 | `api_key_env` | No | unset | Name of the environment variable holding the key. Omit to send no authentication. |
-| `extra_headers` | No | `{}` | Extra HTTP headers sent upstream. |
+| `extra_headers` | No | `{}` | Custom HTTP headers sent to the model server. Setting `api_key_env` together with `Authorization` (OpenAI) or `x-api-key` (Anthropic) creates a conflict because both settings define the same outgoing authentication header. The client sends the API key loaded from `api_key_env` and does not send the conflicting custom value. Without `api_key_env`, the client sends the custom authentication header. Anthropic requests always use the client's required `anthropic-version`. Header names are matched without regard to letter case. |
 | `max_retries` | No | `2` | Retry budget, `0`–`10`. |
 
 The TOML never contains the secret itself. `api_key_env` names a variable that

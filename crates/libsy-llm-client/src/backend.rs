@@ -42,7 +42,12 @@ pub struct HttpBackendConfig {
     pub base_url: String,
     /// API key for the provider, loaded by the caller. `None` sends no auth.
     pub api_key: Option<String>,
-    /// Static headers added to every outbound call to this backend.
+    /// Custom headers added to every outbound call to this backend.
+    ///
+    /// Setting `api_key` together with `Authorization` (OpenAI) or `x-api-key`
+    /// (Anthropic) here creates a conflict. The client sends the value from
+    /// `api_key` and omits the conflicting custom value. Anthropic requests
+    /// always use the client's required version.
     pub extra_headers: BTreeMap<String, String>,
     /// Default top-level request fields, applied only when the request omits the key.
     pub extra_body: BTreeMap<String, Value>,
@@ -130,7 +135,21 @@ impl Backend {
         builder
     }
 
-    /// Static per-backend headers to forward on every call.
+    /// Whether to send `name` from `extra_headers` for this backend.
+    pub(crate) fn should_send_extra_header(&self, name: &str) -> bool {
+        let has_api_key = self.config().api_key.is_some();
+        match self {
+            Backend::OpenAiChat(_) | Backend::OpenAiResponses(_) => {
+                !(has_api_key && name.eq_ignore_ascii_case("authorization"))
+            }
+            Backend::Anthropic(_) => {
+                !(name.eq_ignore_ascii_case("anthropic-version")
+                    || has_api_key && name.eq_ignore_ascii_case("x-api-key"))
+            }
+        }
+    }
+
+    /// Custom per-backend headers to forward on every call.
     pub fn extra_headers(&self) -> &BTreeMap<String, String> {
         &self.config().extra_headers
     }

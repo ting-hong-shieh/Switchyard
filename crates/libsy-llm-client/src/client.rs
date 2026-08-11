@@ -643,9 +643,12 @@ fn forward_metadata_headers(
     builder
 }
 
-// Adds the backend's static per-call headers.
+// Adds custom headers unless the backend will set the same header.
 fn apply_extra_headers(mut builder: RequestBuilder, backend: &Backend) -> RequestBuilder {
     for (name, value) in backend.extra_headers() {
+        if !backend.should_send_extra_header(name) {
+            continue;
+        }
         builder = builder.header(name, value);
     }
     builder
@@ -1748,6 +1751,87 @@ mod tests {
             error,
             LlmClientError::ContextWindowExceeded { model, .. } if model == "gpt"
         ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn api_key_takes_priority_over_matching_extra_header()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "1", "model": "gpt",
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+                "usage": {}
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "msg_1", "type": "message", "role": "assistant", "model": "claude",
+                "content": [{"type": "text", "text": "ok"}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 1, "output_tokens": 1}
+            })))
+            .mount(&server)
+            .await;
+
+        let openai_headers = BTreeMap::from([
+            ("AUTHORIZATION".to_string(), "Bearer extra-key".to_string()),
+            ("X-Inference-Priority".to_string(), "batch".to_string()),
+        ]);
+        for api_key in [Some("secret"), None] {
+            let mut backend = config(&format!("{}/v1", server.uri()));
+            backend.api_key = api_key.map(str::to_string);
+            backend.extra_headers = openai_headers.clone();
+            TranslatingLlmClient::new(&[ModelConfig::new(
+                "gpt",
+                Backend::OpenAiChat(backend),
+                None,
+            )])?
+            .call_rewrite_model(request_for(Some("gpt"), false), None)
+            .await?;
+        }
+
+        let anthropic_headers = BTreeMap::from([
+            ("X-Api-Key".to_string(), "extra-key".to_string()),
+            (
+                "ANTHROPIC-VERSION".to_string(),
+                "custom-version".to_string(),
+            ),
+        ]);
+        for api_key in [Some("secret"), None] {
+            let mut backend = config(&server.uri());
+            backend.api_key = api_key.map(str::to_string);
+            backend.extra_headers = anthropic_headers.clone();
+            TranslatingLlmClient::new(&[ModelConfig::new(
+                "claude",
+                Backend::Anthropic(backend),
+                None,
+            )])?
+            .call_rewrite_model(request_for(Some("claude"), false), None)
+            .await?;
+        }
+
+        let requests = server
+            .received_requests()
+            .await
+            .ok_or("request recording should be enabled")?;
+        assert_eq!(requests.len(), 4);
+        assert_eq!(
+            requests[0].headers.get_all("authorization").iter().count(),
+            1
+        );
+        assert_eq!(requests[0].headers["authorization"], "Bearer secret");
+        assert_eq!(requests[0].headers["x-inference-priority"], "batch");
+        assert_eq!(requests[1].headers["authorization"], "Bearer extra-key");
+        assert_eq!(requests[2].headers.get_all("x-api-key").iter().count(), 1);
+        assert_eq!(requests[2].headers["x-api-key"], "secret");
+        assert_eq!(requests[2].headers["anthropic-version"], "2023-06-01");
+        assert_eq!(requests[3].headers["x-api-key"], "extra-key");
+        assert_eq!(requests[3].headers["anthropic-version"], "2023-06-01");
         Ok(())
     }
 
