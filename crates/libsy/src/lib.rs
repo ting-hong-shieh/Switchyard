@@ -16,6 +16,7 @@ mod error;
 pub use error::{DriverError, LibsyError, Result};
 
 mod algorithms;
+pub use algorithms::advisor_gate::{AdvisorGate, AdvisorGateConfig, GateTrigger};
 pub use algorithms::llm_class::{
     CustomClassifierConfig, CustomClassifierPolicy, LlmClassifierConfig, LlmTaskClassifier,
     TaskClassifierConfig,
