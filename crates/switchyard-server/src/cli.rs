@@ -3,6 +3,8 @@
 
 //! CLI entrypoint for running the configured libsy server.
 
+mod base_url_validation;
+
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 
@@ -69,6 +71,7 @@ impl ServerArgs {
 
     fn into_runtime(self) -> ServerResult<(ServerState, ServerRunOptions)> {
         let mut state = load_server_state(&self.config)?;
+        base_url_validation::validate_client_base_urls(&self.config)?;
         if let Some(path) = self.routing_log_file {
             state = state.with_routing_log(path)?;
         }
