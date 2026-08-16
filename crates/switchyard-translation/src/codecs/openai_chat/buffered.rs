@@ -804,6 +804,7 @@ fn encode_message_without_tool_results_to_openai(
         "role": role,
         "content": encode_openai_content(&content_blocks, message.role, diagnostics, policy)?,
     });
+    encode_openai_reasoning_content(&mut message_json, message, diagnostics, policy)?;
     if !tool_calls.is_empty() {
         message_json["tool_calls"] = Value::Array(tool_calls);
         if message_json["content"] == Value::String(String::new()) {
@@ -811,6 +812,42 @@ fn encode_message_without_tool_results_to_openai(
         }
     }
     Ok(message_json)
+}
+
+// Replays assistant reasoning as the top-level OpenAI `reasoning_content` field.
+//
+// This mirrors `prepend_openai_reasoning_blocks` on the decode side. Reasoning-
+// required targets reject a follow-up turn whose assistant history omits the
+// field, while targets that reject unrecognized message fields reject the field
+// itself, so it is sent only for a target that declares the capability.
+fn encode_openai_reasoning_content(
+    message_json: &mut Value,
+    message: &Message,
+    diagnostics: &mut Vec<TranslationDiagnostic>,
+    policy: &TranslationPolicy,
+) -> Result<()> {
+    let reasoning = reasoning_text_from_blocks(&message.content, "\n");
+    if reasoning.is_empty() {
+        return Ok(());
+    }
+    if policy.target_capabilities.supports_reasoning_content != Some(true) {
+        push_lossy(
+            diagnostics,
+            policy,
+            "target format/profile does not declare support for reasoning content in requests; assistant reasoning was dropped",
+        )?;
+        return Ok(());
+    }
+    if !matches!(message.role, Role::Assistant) {
+        push_lossy(
+            diagnostics,
+            policy,
+            "OpenAI Chat carries reasoning on assistant messages only; reasoning content was dropped",
+        )?;
+        return Ok(());
+    }
+    message_json["reasoning_content"] = Value::String(reasoning);
+    Ok(())
 }
 
 // Checks whether any block in a message is a tool result.

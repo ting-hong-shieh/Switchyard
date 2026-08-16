@@ -6,7 +6,8 @@
 use pretty_assertions::assert_eq;
 use serde_json::{Value, json};
 use switchyard_translation::{
-    LossyConversionPolicy, TranslationEngine, TranslationPolicy, WireFormat,
+    LossyConversionPolicy, PreservationPolicy, TargetCapabilities, TranslationEngine,
+    TranslationPolicy, WireFormat,
 };
 
 type TestResult = std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>;
@@ -191,6 +192,197 @@ fn openai_reasoning_content_does_not_forge_anthropic_thinking_block() -> TestRes
 
     assert_eq!(output["messages"][1]["role"], "assistant");
     assert_eq!(output["messages"][1]["content"], "Visible answer");
+    assert!(!json_contains_content_type(&output, "thinking"));
+    Ok(())
+}
+
+fn openai_reasoning_history() -> Value {
+    json!({
+        "model": "deepseek-reasoner",
+        "messages": [
+            {"role": "user", "content": "Use private reasoning."},
+            {
+                "role": "assistant",
+                "reasoning_content": "private chain of thought",
+                "content": "Visible answer"
+            },
+            {"role": "user", "content": "Continue."}
+        ]
+    })
+}
+
+// Same-format translation replays the exact source request when preservation is
+// enabled, so these cases disable it to reach the encoder at all.
+fn reencoding_openai_policy(supports_reasoning_content: Option<bool>) -> TranslationPolicy {
+    TranslationPolicy {
+        preservation: PreservationPolicy::Disabled,
+        target_capabilities: TargetCapabilities {
+            supports_reasoning_content,
+            ..TargetCapabilities::default()
+        },
+        ..TranslationPolicy::default()
+    }
+}
+
+#[test]
+fn openai_chat_replays_reasoning_content_for_declared_target() -> TestResult {
+    let engine = TranslationEngine::default();
+    let policy = reencoding_openai_policy(Some(true));
+
+    let translated = engine.translate_request(
+        WireFormat::OpenAiChat,
+        WireFormat::OpenAiChat,
+        &openai_reasoning_history(),
+        &policy,
+    )?;
+
+    assert_eq!(
+        translated.body["messages"][1]["reasoning_content"],
+        "private chain of thought"
+    );
+    assert_eq!(translated.body["messages"][1]["content"], "Visible answer");
+    assert!(
+        translated.body["messages"][0]
+            .get("reasoning_content")
+            .is_none()
+    );
+    assert!(translated.diagnostics.is_empty());
+    Ok(())
+}
+
+#[test]
+fn openai_chat_drops_reasoning_content_with_diagnostic_for_undeclared_target() -> TestResult {
+    let engine = TranslationEngine::default();
+
+    let translated = engine.translate_request(
+        WireFormat::OpenAiChat,
+        WireFormat::OpenAiChat,
+        &openai_reasoning_history(),
+        &reencoding_openai_policy(None),
+    )?;
+
+    assert!(
+        translated.body["messages"][1]
+            .get("reasoning_content")
+            .is_none()
+    );
+    assert_eq!(translated.body["messages"][1]["content"], "Visible answer");
+    assert!(translated.diagnostics.iter().any(|diagnostic| {
+        diagnostic
+            .message
+            .contains("does not declare support for reasoning content in requests")
+    }));
+    Ok(())
+}
+
+#[test]
+fn openai_chat_rejects_dropped_reasoning_content_under_strict_policy() -> TestResult {
+    let engine = TranslationEngine::default();
+    let policy = TranslationPolicy {
+        lossy_conversion_policy: LossyConversionPolicy::Reject,
+        ..reencoding_openai_policy(None)
+    };
+
+    let error = match engine.translate_request(
+        WireFormat::OpenAiChat,
+        WireFormat::OpenAiChat,
+        &openai_reasoning_history(),
+        &policy,
+    ) {
+        Ok(_) => panic!("dropped reasoning content should be rejected by strict policy"),
+        Err(error) => error,
+    };
+
+    assert_eq!(error.kind(), "LossyConversion");
+    Ok(())
+}
+
+// Reasoning has to land beside `tool_calls` rather than displace it, and the tool
+// result has to keep following the call it answers, or a reasoning-required upstream
+// rejects the turn for a missing field or an orphaned tool message.
+#[test]
+fn openai_chat_replays_reasoning_content_alongside_tool_calls() -> TestResult {
+    let engine = TranslationEngine::default();
+    let body = json!({
+        "model": "deepseek-reasoner",
+        "messages": [
+            {"role": "user", "content": "What is 2+2? Use the calculator."},
+            {
+                "role": "assistant",
+                "content": "I'll call the tool.",
+                "reasoning_content": "The user wants to compute 2+2. Let me call the calculator.",
+                "tool_calls": [{
+                    "id": "call_abc123",
+                    "type": "function",
+                    "function": {"name": "calculator", "arguments": "{\"a\": 2, \"b\": 2}"}
+                }]
+            },
+            {"role": "tool", "tool_call_id": "call_abc123", "content": "4"}
+        ]
+    });
+
+    let output = engine
+        .translate_request(
+            WireFormat::OpenAiChat,
+            WireFormat::OpenAiChat,
+            &body,
+            &reencoding_openai_policy(Some(true)),
+        )?
+        .body;
+
+    let assistant = &output["messages"][1];
+    assert_eq!(
+        assistant["reasoning_content"],
+        "The user wants to compute 2+2. Let me call the calculator."
+    );
+    assert_eq!(assistant["content"], "I'll call the tool.");
+    assert_eq!(assistant["tool_calls"][0]["id"], "call_abc123");
+    assert_eq!(assistant["tool_calls"][0]["function"]["name"], "calculator");
+    assert_eq!(output["messages"][2]["role"], "tool");
+    assert_eq!(output["messages"][2]["tool_call_id"], "call_abc123");
+    Ok(())
+}
+
+#[test]
+fn anthropic_thinking_replays_as_openai_reasoning_content_for_declared_target() -> TestResult {
+    let engine = TranslationEngine::default();
+    let body = json!({
+        "model": "claude-opus-4-20250514",
+        "messages": [
+            {"role": "user", "content": "Use the tool."},
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "thinking", "thinking": "I should call the tool.", "signature": "sig-abc"},
+                    {"type": "text", "text": "Calling it now."}
+                ]
+            },
+            {"role": "user", "content": "Continue."}
+        ],
+        "max_tokens": 2048
+    });
+    let policy = TranslationPolicy {
+        target_capabilities: TargetCapabilities {
+            supports_reasoning_content: Some(true),
+            ..TargetCapabilities::default()
+        },
+        ..TranslationPolicy::default()
+    };
+
+    let output = engine
+        .translate_request(
+            WireFormat::AnthropicMessages,
+            WireFormat::OpenAiChat,
+            &body,
+            &policy,
+        )?
+        .body;
+
+    assert_eq!(
+        output["messages"][1]["reasoning_content"],
+        "I should call the tool."
+    );
+    assert_eq!(output["messages"][1]["content"], "Calling it now.");
     assert!(!json_contains_content_type(&output, "thinking"));
     Ok(())
 }

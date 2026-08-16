@@ -52,6 +52,15 @@ pub struct TargetCapabilities {
     pub supports_video: Option<bool>,
     pub supports_files: Option<bool>,
     pub supports_reasoning_effort: Option<bool>,
+    /// Whether the target accepts assistant reasoning replayed in request history.
+    ///
+    /// Unlike the other capability flags, this one is opt-in: reasoning is
+    /// encoded only when it is `Some(true)`. Targets such as DeepSeek's thinking
+    /// models reject a follow-up turn whose assistant history has no
+    /// `reasoning_content`, while stricter OpenAI-compatible targets reject the
+    /// field as an unrecognized argument, so the safe default is to keep it off
+    /// and let the caller declare the target.
+    pub supports_reasoning_content: Option<bool>,
     pub supports_json_schema_response_format: Option<bool>,
     pub supports_parallel_tool_calls: Option<bool>,
     pub supports_code_execution: Option<bool>,
