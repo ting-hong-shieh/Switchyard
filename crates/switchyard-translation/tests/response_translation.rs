@@ -54,6 +54,100 @@ fn openai_chat_response_translates_to_anthropic_message() -> TestResult {
     Ok(())
 }
 
+// Keeps reused provider tool IDs distinct across responses while restoring them on replay.
+#[test]
+fn repeated_openai_tool_ids_are_unique_and_reversible_for_anthropic() -> TestResult {
+    let engine = TranslationEngine::default();
+    let tool_response = |id: &str, name: &str| {
+        json!({
+            "id": id,
+            "model": "grok-4.6",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_0",
+                        "type": "function",
+                        "function": {"name": name, "arguments": "{}"}
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        })
+    };
+    let first_body = tool_response("chatcmpl-first", "read");
+    let second_body = tool_response("chatcmpl-second", "edit");
+
+    let first = engine
+        .translate_response(
+            WireFormat::OpenAiChat,
+            WireFormat::AnthropicMessages,
+            &first_body,
+            &TranslationPolicy::default(),
+        )?
+        .body;
+    let second = engine
+        .translate_response(
+            WireFormat::OpenAiChat,
+            WireFormat::AnthropicMessages,
+            &second_body,
+            &TranslationPolicy::default(),
+        )?
+        .body;
+    let first_tool = first["content"]
+        .as_array()
+        .and_then(|content| content.iter().find(|block| block["type"] == "tool_use"))
+        .cloned()
+        .ok_or_else(|| format!("first response should contain a tool call: {first}"))?;
+    let second_tool = second["content"]
+        .as_array()
+        .and_then(|content| content.iter().find(|block| block["type"] == "tool_use"))
+        .cloned()
+        .ok_or_else(|| format!("second response should contain a tool call: {second}"))?;
+    let first_id = first_tool["id"]
+        .as_str()
+        .ok_or("first translated tool call should have an ID")?
+        .to_string();
+    let second_id = second_tool["id"]
+        .as_str()
+        .ok_or("second translated tool call should have an ID")?
+        .to_string();
+    assert_ne!(first_id, second_id);
+
+    let replay = json!({
+        "model": "claude-sonnet",
+        "messages": [
+            {"role": "assistant", "content": [first_tool]},
+            {
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": first_id, "content": "read"}]
+            },
+            {"role": "assistant", "content": [second_tool]},
+            {
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": second_id, "content": "edited"}]
+            }
+        ],
+        "max_tokens": 100
+    });
+    let replayed = engine
+        .translate_request(
+            WireFormat::AnthropicMessages,
+            WireFormat::OpenAiChat,
+            &replay,
+            &TranslationPolicy::default(),
+        )?
+        .body;
+
+    assert_eq!(replayed["messages"][0]["tool_calls"][0]["id"], "call_0");
+    assert_eq!(replayed["messages"][1]["tool_call_id"], "call_0");
+    assert_eq!(replayed["messages"][2]["tool_calls"][0]["id"], "call_0");
+    assert_eq!(replayed["messages"][3]["tool_call_id"], "call_0");
+    Ok(())
+}
+
 // Verifies Anthropic message responses map to OpenAI Chat completions.
 #[test]
 fn anthropic_message_response_translates_to_openai_chat_completion() -> TestResult {

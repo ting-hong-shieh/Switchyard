@@ -11,7 +11,7 @@ use crate::codecs::stream::{
     target_message_id_or_source_message_id, target_model_or_source_model,
 };
 use crate::format::{FormatId, WireFormat};
-use crate::util::sanitize_anthropic_tool_use_id;
+use crate::util::namespace_anthropic_tool_use_id;
 
 /// Stream codec for Anthropic Messages events.
 pub struct AnthropicMessagesStreamCodec;
@@ -259,6 +259,23 @@ fn finish_anthropic_stream(state: &mut StreamTranslationState) -> Vec<Value> {
 
     out.extend(close_anthropic_reasoning_block(state));
 
+    let pending_tool_indices = state
+        .tool_states
+        .iter_mut()
+        .filter_map(|(index, tool)| {
+            if tool.started || tool.name.is_none() {
+                return None;
+            }
+            if tool.id.is_none() {
+                tool.id = Some(format!("toolu_{index}"));
+            }
+            Some(*index)
+        })
+        .collect::<Vec<_>>();
+    for index in pending_tool_indices {
+        out.extend(encode_anthropic_tool_delta(state, index, None, None, None));
+    }
+
     for tool in state.tool_states.values_mut() {
         if tool.started {
             if let Some(index) = tool.content_index {
@@ -471,9 +488,10 @@ fn encode_anthropic_tool_delta(
         state.text_block_started = false;
     }
 
+    let source_message_id = state.message_id.as_deref().unwrap_or("msg_switchyard");
     let tool = state.tool_states.entry(index).or_default();
     if id.is_some() {
-        tool.id = id.map(|id| sanitize_anthropic_tool_use_id(&id));
+        tool.id = id.map(|id| namespace_anthropic_tool_use_id(&id, source_message_id, index));
     }
     if name.is_some() {
         tool.name = name;
@@ -487,6 +505,9 @@ fn encode_anthropic_tool_delta(
         let Some(name) = tool.name.clone() else {
             return out;
         };
+        let Some(id) = tool.id.clone() else {
+            return out;
+        };
         let content_index = state.next_content_index;
         state.next_content_index += 1;
         tool.content_index = Some(content_index);
@@ -497,7 +518,7 @@ fn encode_anthropic_tool_delta(
             "index": content_index,
             "content_block": {
                 "type": "tool_use",
-                "id": tool.id.clone().unwrap_or_else(|| format!("toolu_{index}")),
+                "id": id,
                 "name": name,
                 "input": {},
             },

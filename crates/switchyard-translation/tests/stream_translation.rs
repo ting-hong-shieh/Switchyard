@@ -11,8 +11,8 @@ use pretty_assertions::assert_eq;
 use serde_json::{Value, json};
 use switchyard_protocol::{LlmResponseStreamEvent, ResponseAccumulator, StopReason};
 use switchyard_translation::{
-    LlmResponseChunk, StreamTranslationState, TranslationEngine, WireFormat, decode_stream_event,
-    sanitize_anthropic_tool_use_id,
+    LlmResponseChunk, StreamTranslationState, TranslationEngine, TranslationPolicy, WireFormat,
+    decode_stream_event,
 };
 
 use common::{REASONING_MODEL, text_and_encrypted_reasoning_details};
@@ -401,47 +401,140 @@ fn openai_chat_stream_event_translates_to_anthropic_message_events() -> TestResu
     Ok(())
 }
 
-// Verifies unsafe streamed tool IDs use the same reversible Anthropic-safe encoding.
+// Verifies streamed tool IDs are occurrence-aware and reversible across responses.
 #[test]
-fn openai_chat_stream_tool_id_is_anthropic_safe() -> TestResult {
+fn repeated_openai_stream_tool_ids_are_unique_and_reversible() -> TestResult {
     let engine = TranslationEngine::default();
-    let mut state =
-        StreamTranslationState::new(WireFormat::OpenAiChat, WireFormat::AnthropicMessages);
-    let raw_id = "functions.list_skills:0";
-    let chunk = json!({
-        "id": "chatcmpl-test",
-        "object": "chat.completion.chunk",
-        "model": "moonshotai/kimi-k2",
-        "choices": [{
-            "index": 0,
-            "delta": {
-                "tool_calls": [{
+    let mut translated_ids = Vec::new();
+    for response_id in ["chatcmpl-first", "chatcmpl-second"] {
+        let mut state =
+            StreamTranslationState::new(WireFormat::OpenAiChat, WireFormat::AnthropicMessages);
+        let chunk = json!({
+            "id": response_id,
+            "object": "chat.completion.chunk",
+            "model": "grok-4.6",
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "tool_calls": [{
+                        "index": 0,
+                        "type": "function",
+                        "function": {"name": "lookup"}
+                    }]
+                },
+                "finish_reason": null
+            }]
+        });
+        let mut events = engine.translate_event(
+            &mut state,
+            WireFormat::OpenAiChat,
+            WireFormat::AnthropicMessages,
+            &chunk,
+        )?;
+        events.extend(engine.translate_event(
+            &mut state,
+            WireFormat::OpenAiChat,
+            WireFormat::AnthropicMessages,
+            &json!({
+                "id": response_id,
+                "object": "chat.completion.chunk",
+                "model": "grok-4.6",
+                "choices": [{
                     "index": 0,
-                    "id": raw_id,
-                    "type": "function",
-                    "function": {"name": "list_skills", "arguments": "{}"}
+                    "delta": {
+                        "tool_calls": [{
+                            "index": 0,
+                            "id": "call_0",
+                            "function": {"arguments": "{}"}
+                        }]
+                    },
+                    "finish_reason": null
                 }]
-            },
-            "finish_reason": null
-        }]
-    });
+            }),
+        )?);
+        let tool_id = events
+            .iter()
+            .find(|event| {
+                event["type"] == "content_block_start"
+                    && event["content_block"]["type"] == "tool_use"
+            })
+            .and_then(|event| event["content_block"]["id"].as_str())
+            .ok_or("expected an Anthropic tool_use content block")?;
+        translated_ids.push(tool_id.to_string());
+    }
+    assert_ne!(translated_ids[0], translated_ids[1]);
 
-    let events = engine.translate_event(
-        &mut state,
+    for translated_id in translated_ids {
+        let replay = json!({
+            "model": "claude-sonnet",
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": [{
+                        "type": "tool_use",
+                        "id": translated_id,
+                        "name": "lookup",
+                        "input": {}
+                    }]
+                },
+                {
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": translated_id,
+                        "content": "done"
+                    }]
+                }
+            ],
+            "max_tokens": 100
+        });
+        let replayed = engine
+            .translate_request(
+                WireFormat::AnthropicMessages,
+                WireFormat::OpenAiChat,
+                &replay,
+                &TranslationPolicy::default(),
+            )?
+            .body;
+        assert_eq!(replayed["messages"][0]["tool_calls"][0]["id"], "call_0");
+        assert_eq!(replayed["messages"][1]["tool_call_id"], "call_0");
+    }
+
+    let mut missing_id_state =
+        StreamTranslationState::new(WireFormat::OpenAiChat, WireFormat::AnthropicMessages);
+    let mut missing_id_events = engine.translate_event(
+        &mut missing_id_state,
         WireFormat::OpenAiChat,
         WireFormat::AnthropicMessages,
-        &chunk,
+        &json!({
+            "id": "chatcmpl-missing-id",
+            "object": "chat.completion.chunk",
+            "model": "grok-4.6",
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "tool_calls": [{
+                        "index": 0,
+                        "function": {"name": "lookup", "arguments": "{}"}
+                    }]
+                },
+                "finish_reason": null
+            }]
+        }),
     )?;
-    let Some(tool_start) = events.iter().find(|event| {
+    assert!(!missing_id_events.iter().any(|event| {
         event["type"] == "content_block_start" && event["content_block"]["type"] == "tool_use"
-    }) else {
-        return Err("expected an Anthropic tool_use content block".into());
-    };
-
-    assert_eq!(
-        tool_start["content_block"]["id"],
-        sanitize_anthropic_tool_use_id(raw_id)
-    );
+    }));
+    missing_id_events
+        .extend(engine.finish_stream(&mut missing_id_state, WireFormat::AnthropicMessages)?);
+    let fallback_id = missing_id_events
+        .iter()
+        .find(|event| {
+            event["type"] == "content_block_start" && event["content_block"]["type"] == "tool_use"
+        })
+        .and_then(|event| event["content_block"]["id"].as_str())
+        .ok_or("expected an ID-less tool call to use a fallback ID at stream end")?;
+    assert_eq!(fallback_id, "toolu_0");
     Ok(())
 }
 
