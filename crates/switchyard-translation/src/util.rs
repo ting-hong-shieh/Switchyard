@@ -22,6 +22,7 @@ pub const SWITCHYARD_METADATA_KEY: &str = "_switchyard_translation";
 pub const PRESERVATION_METADATA_KEY: &str = SWITCHYARD_METADATA_KEY;
 
 const ANTHROPIC_TOOL_ID_ENCODING_PREFIX: &str = "sy64_";
+const ANTHROPIC_TOOL_ID_OCCURRENCE_PREFIX: &str = "sy64o_";
 
 /// Reads a JSON object or returns a typed translation error at the given path.
 pub fn object<'a>(value: &'a Value, path: &str) -> Result<&'a Map<String, Value>> {
@@ -336,7 +337,10 @@ pub fn sanitize_anthropic_tool_use_id(raw: &str) -> String {
         && raw
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-');
-    if is_safe && !raw.starts_with(ANTHROPIC_TOOL_ID_ENCODING_PREFIX) {
+    if is_safe
+        && !raw.starts_with(ANTHROPIC_TOOL_ID_ENCODING_PREFIX)
+        && !raw.starts_with(ANTHROPIC_TOOL_ID_OCCURRENCE_PREFIX)
+    {
         return raw.to_string();
     }
 
@@ -346,8 +350,28 @@ pub fn sanitize_anthropic_tool_use_id(raw: &str) -> String {
     )
 }
 
-/// Restores an ID encoded by [`sanitize_anthropic_tool_use_id`].
+// Includes the response identity and tool position so provider-local IDs remain distinct.
+pub(crate) fn namespace_anthropic_tool_use_id(
+    raw: &str,
+    source_message_id: &str,
+    tool_index: usize,
+) -> String {
+    let mut payload = Vec::with_capacity(16 + source_message_id.len() + raw.len());
+    payload.extend_from_slice(&(source_message_id.len() as u64).to_be_bytes());
+    payload.extend_from_slice(source_message_id.as_bytes());
+    payload.extend_from_slice(&(tool_index as u64).to_be_bytes());
+    payload.extend_from_slice(raw.as_bytes());
+    format!(
+        "{ANTHROPIC_TOOL_ID_OCCURRENCE_PREFIX}{}",
+        URL_SAFE_NO_PAD.encode(payload)
+    )
+}
+
+/// Restores a sanitized or occurrence-aware provider tool ID.
 pub(crate) fn desanitize_anthropic_tool_use_id(encoded: &str) -> String {
+    if let Some(payload) = encoded.strip_prefix(ANTHROPIC_TOOL_ID_OCCURRENCE_PREFIX) {
+        return decode_occurrence_tool_id(payload).unwrap_or_else(|| encoded.to_string());
+    }
     let Some(payload) = encoded.strip_prefix(ANTHROPIC_TOOL_ID_ENCODING_PREFIX) else {
         return encoded.to_string();
     };
@@ -357,6 +381,16 @@ pub(crate) fn desanitize_anthropic_tool_use_id(encoded: &str) -> String {
         .ok()
         .and_then(|bytes| String::from_utf8(bytes).ok())
         .unwrap_or_else(|| encoded.to_string())
+}
+
+// Extracts the original provider ID from an occurrence-aware payload.
+fn decode_occurrence_tool_id(payload: &str) -> Option<String> {
+    let decoded = URL_SAFE_NO_PAD.decode(payload).ok()?;
+    let mut message_len_bytes = [0_u8; 8];
+    message_len_bytes.copy_from_slice(decoded.get(..8)?);
+    let message_len = usize::try_from(u64::from_be_bytes(message_len_bytes)).ok()?;
+    let raw_offset = 8_usize.checked_add(message_len)?.checked_add(8)?;
+    String::from_utf8(decoded.get(raw_offset..)?.to_vec()).ok()
 }
 
 // Normalizes every content block in one Anthropic message.
@@ -457,7 +491,10 @@ fn stable_suffix(raw: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{desanitize_anthropic_tool_use_id, sanitize_anthropic_tool_use_id};
+    use super::{
+        desanitize_anthropic_tool_use_id, namespace_anthropic_tool_use_id,
+        sanitize_anthropic_tool_use_id,
+    };
 
     // Keeps ordinary provider IDs unchanged while making unsafe IDs reversible.
     #[test]
@@ -481,10 +518,26 @@ mod tests {
     // Escapes the reserved prefix and leaves malformed encoded values untouched.
     #[test]
     fn anthropic_tool_id_encoding_disambiguates_its_prefix() {
-        let raw = "sy64_Zm9v";
-        let encoded = sanitize_anthropic_tool_use_id(raw);
-        assert_ne!(encoded, raw);
-        assert_eq!(desanitize_anthropic_tool_use_id(&encoded), raw);
+        for raw in ["sy64_Zm9v", "sy64o_AAAAAAAAAAA"] {
+            let encoded = sanitize_anthropic_tool_use_id(raw);
+            assert_ne!(encoded, raw);
+            assert_eq!(desanitize_anthropic_tool_use_id(&encoded), raw);
+        }
         assert_eq!(desanitize_anthropic_tool_use_id("sy64_%%%"), "sy64_%%%");
+        assert_eq!(desanitize_anthropic_tool_use_id("sy64o_%%%"), "sy64o_%%%");
+    }
+
+    // Makes repeated raw IDs unique without changing the ID restored upstream.
+    #[test]
+    fn anthropic_tool_id_occurrences_are_unique_and_reversible() {
+        let first = namespace_anthropic_tool_use_id("call_0", "chatcmpl-first", 0);
+        let second = namespace_anthropic_tool_use_id("call_0", "chatcmpl-second", 0);
+        let parallel = namespace_anthropic_tool_use_id("call_0", "chatcmpl-first", 1);
+
+        assert_ne!(first, second);
+        assert_ne!(first, parallel);
+        for encoded in [first, second, parallel] {
+            assert_eq!(desanitize_anthropic_tool_use_id(&encoded), "call_0");
+        }
     }
 }

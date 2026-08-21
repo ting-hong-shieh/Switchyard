@@ -19,10 +19,10 @@ use crate::llm::{
     SamplingParams, StopReason, ToolCall, ToolChoice, ToolDefinition, ToolResult, Usage,
 };
 use crate::policy::{DeterministicIdPolicy, TranslationPolicy};
-use crate::util::sanitize_anthropic_tool_use_id;
 use crate::util::{
     capture_request_preservation, capture_response_preservation, embed_preservation,
-    exact_preserved_request, exact_preserved_response,
+    exact_preserved_request, exact_preserved_response, namespace_anthropic_tool_use_id,
+    sanitize_anthropic_tool_use_id,
 };
 use crate::util::{
     json_string, push_lossy, stable_id, string_value, validate_request_capabilities,
@@ -339,8 +339,9 @@ impl FormatCodec for AnthropicMessagesCodec {
             });
         }
         let output = response.first_output();
+        let source_message_id = response.id.as_deref().unwrap_or("msg_switchyard");
         let content = output
-            .map(|output| encode_anthropic_content(&output.content))
+            .map(|output| encode_anthropic_content(&output.content, source_message_id))
             .unwrap_or_else(|| vec![json!({"type": "text", "text": ""})]);
         let normalized_stop_reason = output.and_then(|output| output.stop_reason);
         let body = json!({
@@ -835,10 +836,13 @@ fn encode_anthropic_content_with_policy(
 }
 
 // Encodes content without producing diagnostics for response paths.
-fn encode_anthropic_content(content: &[ContentBlock]) -> Vec<Value> {
+fn encode_anthropic_content(content: &[ContentBlock], source_message_id: &str) -> Vec<Value> {
+    let mut tool_index = 0;
     let mut blocks = content
         .iter()
-        .flat_map(encode_one_anthropic_response_block)
+        .flat_map(|block| {
+            encode_one_anthropic_response_block(block, source_message_id, &mut tool_index)
+        })
         .collect::<Vec<_>>();
     if blocks.is_empty() {
         blocks.push(json!({"type": "text", "text": ""}));
@@ -847,7 +851,11 @@ fn encode_anthropic_content(content: &[ContentBlock]) -> Vec<Value> {
 }
 
 // Encodes response content, where synthetic reasoning may be shown to clients.
-fn encode_one_anthropic_response_block(block: &ContentBlock) -> Vec<Value> {
+fn encode_one_anthropic_response_block(
+    block: &ContentBlock,
+    source_message_id: &str,
+    tool_index: &mut usize,
+) -> Vec<Value> {
     match block {
         ContentBlock::Reasoning {
             text,
@@ -858,6 +866,16 @@ fn encode_one_anthropic_response_block(block: &ContentBlock) -> Vec<Value> {
             "thinking": text,
             "signature": "",
         })],
+        ContentBlock::ToolCall(call) => {
+            let id = namespace_anthropic_tool_use_id(&call.id, source_message_id, *tool_index);
+            *tool_index += 1;
+            vec![json!({
+                "type": "tool_use",
+                "id": id,
+                "name": call.name,
+                "input": anthropic_tool_input(&call.arguments),
+            })]
+        }
         other => encode_one_anthropic_block(other),
     }
 }
